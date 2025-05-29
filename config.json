@@ -1,0 +1,7 @@
+{
+    "admin_role_names": [],
+    "default_gemini_model": "gemini-2.5-flash-preview-05-20",
+    "tagging_prompt_file": "Tagging_prompt.txt",
+    "base_upload_folder": "uploads",
+    "max_files_to_send_on_search": 5
+}

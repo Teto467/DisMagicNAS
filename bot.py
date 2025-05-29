@@ -10,36 +10,78 @@ import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from PIL import Image
 
-# --- 設定 ---
+# --- 設定ファイル名 ---
+CONFIG_FILE_NAME = "config.json"
+
+# --- デフォルト設定 ---
+DEFAULT_CONFIG = {
+    "admin_role_names": ["BOT管理者", "運営スタッフ"],
+    "default_gemini_model": "gemini-1.5-flash-latest",
+    "tagging_prompt_file": "Tagging_prompt.txt",
+    "base_upload_folder": "uploads",
+    "max_files_to_send_on_search": 5 # この設定は /files get が削除されるため、直接は使われなくなります
+}
+
+# --- 設定読み込み関数 ---
+def load_bot_config():
+    config = DEFAULT_CONFIG.copy()
+    if os.path.exists(CONFIG_FILE_NAME):
+        try:
+            with open(CONFIG_FILE_NAME, "r", encoding="utf-8") as f:
+                loaded_config = json.load(f)
+                config.update(loaded_config)
+                print(f"設定ファイルを '{CONFIG_FILE_NAME}' から読み込みました。")
+        except json.JSONDecodeError:
+            print(f"エラー: '{CONFIG_FILE_NAME}' のJSON形式が正しくありません。デフォルト設定を使用します。")
+        except Exception as e:
+            print(f"エラー: '{CONFIG_FILE_NAME}' の読み込み中に問題が発生しました: {e}。デフォルト設定を使用します。")
+    else:
+        print(f"情報: '{CONFIG_FILE_NAME}' が見つかりません。デフォルト設定で作成します。")
+        try:
+            with open(CONFIG_FILE_NAME, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=4, ensure_ascii=False)
+            print(f"'{CONFIG_FILE_NAME}' をデフォルト設定で作成しました。")
+        except Exception as e:
+            print(f"エラー: '{CONFIG_FILE_NAME}' の作成中に問題が発生しました: {e}")
+    return config
+
+# --- .envとconfig.jsonから設定を読み込む ---
 load_dotenv()
+bot_config = load_bot_config()
+
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-BASE_UPLOAD_FOLDER = os.getenv('BASE_UPLOAD_FOLDER', 'uploads')
-ADMIN_ROLE_NAMES_STR = os.getenv('ADMIN_ROLE_NAMES', 'BOT管理者,運営スタッフ')
-ADMIN_ROLE_NAMES = [name.strip() for name in ADMIN_ROLE_NAMES_STR.split(',')]
-DEFAULT_GEMINI_MODEL = os.getenv('DEFAULT_GEMINI_MODEL', 'gemini-1.5-flash-latest')
 
-# --- タグ付けプロンプトファイル名定義 ---
-TAGGING_PROMPT_FILE = "Tagging_prompt.txt"
+ADMIN_ROLE_NAMES = bot_config.get("admin_role_names", DEFAULT_CONFIG["admin_role_names"])
+DEFAULT_GEMINI_MODEL = bot_config.get("default_gemini_model", DEFAULT_CONFIG["default_gemini_model"])
+TAGGING_PROMPT_FILE = bot_config.get("tagging_prompt_file", DEFAULT_CONFIG["tagging_prompt_file"])
+BASE_UPLOAD_FOLDER = bot_config.get("base_upload_folder", DEFAULT_CONFIG["base_upload_folder"])
+# MAX_FILES_TO_SEND_ON_SEARCH は /files get が削除されるため、直接は使われなくなりますが、設定として残しておきます。
 
-# --- タグ付けプロンプト読み込み関数 ---
+DEFAULT_TAGGING_PROMPT_TEXT = (
+    "このファイルの内容を詳細に分析し、関連性の高いキーワードを5つ提案してください。"
+    "各キーワードは簡潔な日本語で、ハイフン(-)で連結可能な形式でお願いします。"
+    "例: 風景-自然-山-川-晴天"
+    "もし内容が不明瞭な場合やキーワード抽出が難しい場合は、「タグ抽出不可」とだけ返してください。"
+)
+
 def load_tagging_prompt():
-    if os.path.exists(TAGGING_PROMPT_FILE):
+    prompt_file_path = TAGGING_PROMPT_FILE
+    if os.path.exists(prompt_file_path):
         try:
-            with open(TAGGING_PROMPT_FILE, "r", encoding="utf-8") as f:
+            with open(prompt_file_path, "r", encoding="utf-8") as f:
                 prompt = f.read().strip()
                 if prompt:
-                    print(f"タグ付けプロンプトを '{TAGGING_PROMPT_FILE}' から読み込みました。")
+                    print(f"タグ付けプロンプトを '{prompt_file_path}' から読み込みました。")
                     return prompt
                 else:
-                    print(f"警告: '{TAGGING_PROMPT_FILE}' は空です。デフォルトのプロンプトを使用します。")
+                    print(f"警告: '{prompt_file_path}' は空です。デフォルトのプロンプトを使用します。")
         except Exception as e:
-            print(f"警告: '{TAGGING_PROMPT_FILE}' の読み込みに失敗しました: {e}。デフォルトのプロンプトを使用します。")
+            print(f"警告: '{prompt_file_path}' の読み込みに失敗しました: {e}。デフォルトのプロンプトを使用します。")
     else:
-        print(f"情報: '{TAGGING_PROMPT_FILE}' が見つかりません。デフォルトのプロンプトを使用します。")
-    return DEFAULT_TAGGING_PROMPT
+        print(f"情報: '{prompt_file_path}' が見つかりません。デフォルトのプロンプトを使用します。")
+    return DEFAULT_TAGGING_PROMPT_TEXT
 
-# --- Gemini API 初期化 ---
 gemini_model_instance = None
 current_gemini_model = DEFAULT_GEMINI_MODEL
 
@@ -62,37 +104,32 @@ if GEMINI_API_KEY:
 else:
     print("情報: GEMINI_API_KEYが設定されていません。Gemini API関連の機能は利用できません。")
 
-# --- BOT 初期化 ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='/', intents=intents)
 
-# --- ヘルパー関数 ---
 def sanitize_filename_component(text):
     return re.sub(r'[\\/*?:"<>|\s]', '_', text)
 
+# get_file_icon は /files list で使われていたため、現在は直接使われませんが、
+# 将来的に何らかの形でファイル情報を示す際に使える可能性があるので残しておきます。
 def get_file_icon(extension):
     ext = extension.lower()
-    if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
-        return "🖼️"
-    elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
-        return "🎬"
-    elif ext in ['.txt', '.md', '.doc', '.pdf']:
-        return "📄"
-    else:
-        return "📁"
+    if ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']: return "🖼️"
+    elif ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm']: return "🎬"
+    elif ext in ['.txt', '.md', '.doc', '.pdf']: return "📄"
+    else: return "📁"
 
-def create_year_month_folder_if_not_exists(base_folder):
+def create_year_month_folder_if_not_exists(base_folder_from_config):
     now = datetime.datetime.now()
     year_month_folder_name = now.strftime("%Y%m")
-    year_month_folder_path = os.path.join(base_folder, year_month_folder_name)
+    year_month_folder_path = os.path.join(base_folder_from_config, year_month_folder_name)
     if not os.path.exists(year_month_folder_path):
         os.makedirs(year_month_folder_path)
         print(f"年月フォルダ '{year_month_folder_path}' を作成しました。")
     return year_month_folder_path
 
-# --- 管理者チェック ---
 def is_admin():
     async def predicate(ctx):
         if ctx.guild is None:
@@ -105,7 +142,6 @@ def is_admin():
         return False
     return commands.check(predicate)
 
-# --- Gemini API 関連 ---
 async def get_tags_from_gemini(file_path, original_filename, mime_type):
     global gemini_model_instance
     if not gemini_model_instance:
@@ -130,14 +166,13 @@ async def get_tags_from_gemini(file_path, original_filename, mime_type):
         print(f"Gemini APIでのタグ生成中にエラーが発生しました: {e}")
         return "notags"
     finally:
-        if 'uploaded_file' in locals() and uploaded_file:
+        if 'uploaded_file' in locals() and uploaded_file and hasattr(uploaded_file, 'name'):
              try:
-                 # genai.delete_file(uploaded_file.name) # 同期版の場合
+                 # genai.delete_file(uploaded_file.name) # SDKのバージョンやポリシーにより検討
                  pass
              except Exception as e_del:
                  print(f"Gemini APIからアップロードされたファイル {uploaded_file.name} の削除中にエラー: {e_del}")
 
-# --- イベントハンドラ ---
 @bot.event
 async def on_ready():
     global current_gemini_model
@@ -161,9 +196,8 @@ async def on_ready():
     print('------')
 
 @bot.event
-async def on_message(message):
-    if message.author == bot.user:
-        return
+async def on_message(message): # ファイルアップロード時の自動処理は残す
+    if message.author == bot.user: return
     if message.attachments:
         year_month_folder_path = create_year_month_folder_if_not_exists(BASE_UPLOAD_FOLDER)
         ctx = await bot.get_context(message)
@@ -172,17 +206,10 @@ async def on_message(message):
             allowed_video_types = ('.mp4', '.mov', '.avi', '.mkv', '.webm')
             file_ext = os.path.splitext(attachment.filename)[1].lower()
             if not (file_ext in allowed_image_types or file_ext in allowed_video_types):
-                await message.channel.send(
-                    f"ファイル '{attachment.filename}' の形式 ({file_ext}) はサポートされていません。\n"
-                    f"対応形式 (画像): {', '.join(allowed_image_types)}\n"
-                    f"対応形式 (動画): {', '.join(allowed_video_types)}"
-                )
+                await message.channel.send(f"ファイル '{attachment.filename}' の形式 ({file_ext}) はサポートされていません。\n対応形式 (画像): {', '.join(allowed_image_types)}\n対応形式 (動画): {', '.join(allowed_video_types)}")
                 continue
             if attachment.size > 8 * 1024 * 1024 and not (ctx.guild and ctx.guild.premium_tier >= 1):
-                await message.channel.send(
-                    f"ファイル '{attachment.filename}' ({attachment.size // 1024 // 1024}MB) はサイズが大きすぎます。"
-                    "サーバーブーストレベルに応じて上限が緩和されますが、基本は8MBまでです。"
-                )
+                await message.channel.send(f"ファイル '{attachment.filename}' ({attachment.size // 1024 // 1024}MB) はサイズが大きすぎます。サーバーブーストレベルに応じて上限が緩和されますが、基本は8MBまでです。")
                 continue
             temp_save_path = os.path.join(year_month_folder_path, f"temp_{attachment.filename}")
             await attachment.save(temp_save_path)
@@ -192,9 +219,7 @@ async def on_message(message):
                 try:
                     if file_ext in allowed_image_types:
                         try:
-                            img = Image.open(temp_save_path)
-                            img.verify()
-                            img.close()
+                            img = Image.open(temp_save_path); img.verify(); img.close()
                         except Exception as img_err:
                             await processing_msg.edit(content=f"ファイル '{attachment.filename}' は有効な画像ファイルではないか、破損しているようです。処理を中断します。({img_err})")
                             if os.path.exists(temp_save_path): os.remove(temp_save_path)
@@ -215,454 +240,115 @@ async def on_message(message):
             try:
                 os.rename(temp_save_path, final_save_path)
                 print(f"ファイル '{attachment.filename}' を '{final_save_path}' に保存しました。")
-                await processing_msg.edit(content=(
-                    f"ファイル '{attachment.filename}' をアップロードし、'{new_filename}' として保存しました。\n"
-                    f"自動タグ: `{tags_str if tags_str != 'notags' else 'なし'}`"
-                ))
+                await processing_msg.edit(content=(f"ファイル '{attachment.filename}' をアップロードし、'{new_filename}' として保存しました。\n自動タグ: `{tags_str if tags_str != 'notags' else 'なし'}`"))
             except Exception as e:
                 print(f"ファイルのリネーム/保存中にエラー: {e}")
                 await processing_msg.edit(content=f"ファイル '{attachment.filename}' の最終保存中にエラーが発生しました。")
-                if os.path.exists(temp_save_path):
-                    os.remove(temp_save_path)
+                if os.path.exists(temp_save_path): os.remove(temp_save_path)
     await bot.process_commands(message)
 
-# --- ★ オートコンプリート用の関数 ---
-async def year_month_autocomplete(interaction: discord.Interaction, current: str) -> list[discord.app_commands.Choice[str]]:
-    choices = []
-    if os.path.exists(BASE_UPLOAD_FOLDER):
-        for item in os.listdir(BASE_UPLOAD_FOLDER):
-            item_path = os.path.join(BASE_UPLOAD_FOLDER, item)
-            if os.path.isdir(item_path) and re.fullmatch(r"\d{6}", item):
-                if current.lower() in item.lower():
-                    choices.append(discord.app_commands.Choice(name=item, value=item))
-    return choices[:25] # Discordのオートコンプリートの選択肢上限は25個
-
-async def filename_autocomplete(interaction: discord.Interaction, current: str) -> list[discord.app_commands.Choice[str]]:
-    choices = []
-    # コマンドのオプションから year_month を取得しようと試みる
-    # interaction.data は生のインタラクションデータを含む辞書
-    year_month_input = None
-    if interaction.data and 'options' in interaction.data:
-        for option in interaction.data['options']:
-            if option['name'] == 'year_month' and 'value' in option : # year_monthが入力されているか確認
-                year_month_input = option['value']
-                break # 通常、同じ名前のオプションは1つのはず
-            # ネストされたコマンドの場合、さらに深く探索する必要があるかもしれない
-            elif 'options' in option: # サブコマンドやグループの場合
-                 for sub_option in option['options']:
-                    if sub_option['name'] == 'year_month' and 'value' in sub_option:
-                        year_month_input = sub_option['value']
-                        break
-                 if year_month_input:
-                     break
-
-
-    search_folders = []
-    if year_month_input and re.fullmatch(r"\d{6}", str(year_month_input)):
-        target_folder = os.path.join(BASE_UPLOAD_FOLDER, str(year_month_input))
-        if os.path.exists(target_folder) and os.path.isdir(target_folder):
-            search_folders.append(target_folder)
-    elif not year_month_input: # year_month が指定されていない場合は全フォルダを検索（負荷注意）
-        if os.path.exists(BASE_UPLOAD_FOLDER):
-            for item in os.listdir(BASE_UPLOAD_FOLDER):
-                item_path = os.path.join(BASE_UPLOAD_FOLDER, item)
-                if os.path.isdir(item_path) and re.fullmatch(r"\d{6}", item):
-                    search_folders.append(item_path)
-    
-    # current が空の場合は候補を出さないか、あるいは人気ファイルなどを出す（今回は空なら出さない）
-    if not current and not choices: # currentが空なら何もしない（ファイルが多すぎるため）
-        return []
-
-    files_found = []
-    for folder in search_folders:
-        for filename in os.listdir(folder):
-            if os.path.isfile(os.path.join(folder, filename)):
-                if current.lower() in filename.lower():
-                    files_found.append(discord.app_commands.Choice(name=filename, value=filename))
-            if len(files_found) >= 25: # 候補が25件に達したら終了
-                break
-        if len(files_found) >= 25:
-            break
-    return files_found
-
+# --- オートコンプリート用の関数 ---
+# year_month_autocomplete と filename_autocomplete は /files グループが削除されたため不要になりました。
+# gemini_model_autocomplete は /gemini set で使用するため残します。
 async def gemini_model_autocomplete(interaction: discord.Interaction, current: str) -> list[discord.app_commands.Choice[str]]:
     choices = []
-    # 修正: APIキーの存在とモデルインスタンスの初期化状態で判断
-    if not GEMINI_API_KEY or not gemini_model_instance:
-        return []
+    if not GEMINI_API_KEY or not gemini_model_instance: return []
     try:
         for model in genai.list_models():
             if 'generateContent' in model.supported_generation_methods:
                 model_display_name = model.name.replace("models/", "")
                 if current.lower() in model_display_name.lower():
-                    # Choiceのnameが長すぎるとエラーになることがあるため調整
                     choice_name = f"{model_display_name} ({model.display_name})"
-                    if len(choice_name) > 100: # DiscordのChoice名の制限は100文字
+                    if len(choice_name) > 100:
                         choice_name = model_display_name[:97] + "..." if len(model_display_name) > 97 else model_display_name
-
                     choices.append(discord.app_commands.Choice(name=choice_name, value=model_display_name))
-            if len(choices) >= 25:
-                break
-    except Exception as e:
-        print(f"Geminiモデルのオートコンプリート中にエラー: {e}")
+            if len(choices) >= 25: break
+    except Exception as e: print(f"Geminiモデルのオートコンプリート中にエラー: {e}")
     return choices
+
+# --- コマンドグループの定義 ---
+# files_group は削除
+gemini_group = discord.app_commands.Group(name="gemini", description="Geminiモデル関連の操作を行います。")
+
 # --- スラッシュコマンド ---
-@bot.tree.command(name="upload_guide", description="ファイルアップロード方法の案内")
+
+@bot.tree.command(name="upload_guide", description="ファイルアップロード方法の案内") # このコマンドは残す
 async def upload_guide(interaction: discord.Interaction):
     await interaction.response.send_message(
         "ファイルをアップロードするには、このチャンネルに直接ファイルをドラッグ＆ドロップするか、メッセージ入力欄の「+」ボタンからファイルを添付して送信してください。\n"
-        "画像または動画ファイルが対象です。",
-        ephemeral=True
-    )
+        "画像または動画ファイルが対象です。", ephemeral=True)
 
-@bot.tree.command(name="list_files", description="保存されているファイルの一覧を表示します。年月やキーワードで絞り込み可能。")
-@discord.app_commands.describe(year_month="表示したい年月 (例: 202505)。省略すると全期間。", keyword="ファイル名に含まれる検索キーワード。")
-@discord.app_commands.autocomplete(year_month=year_month_autocomplete) # ★ year_month オートコンプリート追加
-async def list_files(interaction: discord.Interaction, year_month: str = None, keyword: str = None):
-    await interaction.response.defer(ephemeral=True)
-    found_files = []
-    search_folders = []
-    if year_month:
-        if not re.fullmatch(r"\d{6}", year_month):
-            await interaction.followup.send("年月の形式が正しくありません。`YYYYMM` (例: `202505`) の形式で入力してください。")
-            return
-        target_folder = os.path.join(BASE_UPLOAD_FOLDER, year_month)
-        if os.path.exists(target_folder) and os.path.isdir(target_folder):
-            search_folders.append(target_folder)
-        else:
-            await interaction.followup.send(f"`{year_month}` に該当するファイルは見つかりませんでした。")
-            return
-    else:
-        if os.path.exists(BASE_UPLOAD_FOLDER):
-            for item in os.listdir(BASE_UPLOAD_FOLDER):
-                item_path = os.path.join(BASE_UPLOAD_FOLDER, item)
-                if os.path.isdir(item_path) and re.fullmatch(r"\d{6}", item):
-                    search_folders.append(item_path)
-    if not search_folders and not year_month:
-        await interaction.followup.send("まだアップロードされたファイルはありません。")
-        return
-    elif not search_folders and year_month:
-         await interaction.followup.send(f"`{year_month}` に該当するファイルは見つかりませんでした。")
-         return
-    for folder in search_folders:
-        for filename in os.listdir(folder):
-            if os.path.isfile(os.path.join(folder, filename)):
-                if keyword:
-                    if keyword.lower() in filename.lower():
-                        found_files.append(filename)
-                else:
-                    found_files.append(filename)
-    if not found_files:
-        msg = "該当するファイルは見つかりませんでした。"
-        if keyword: msg += f" (キーワード: `{keyword}`)"
-        if year_month: msg += f" (年月: `{year_month}`)"
-        await interaction.followup.send(msg)
-        return
-    response_message = f"ファイル一覧 ({len(found_files)}件):\n"
-    if keyword: response_message += f"検索キーワード: `{keyword}`\n"
-    if year_month: response_message += f"年月: `{year_month}`\n"
-    response_message += "```\n"
-    current_length = len(response_message)
-    files_in_chunk = 0
-    for filename in sorted(found_files):
-        file_ext = os.path.splitext(filename)[1]
-        icon = get_file_icon(file_ext)
-        line = f"{icon} {filename}\n"
-        if current_length + len(line) > 1980:
-            response_message += "```"
-            await interaction.followup.send(response_message)
-            response_message = "```\n" + line
-            current_length = len(response_message)
-            files_in_chunk = 1
-        else:
-            response_message += line
-            current_length += len(line)
-            files_in_chunk +=1
-    if files_in_chunk > 0:
-        response_message += "```"
-        await interaction.followup.send(response_message)
+# --- /files サブコマンド群は全て削除 ---
 
-@bot.tree.command(name="search_files", description="ファイル名やタグでファイルを検索します。")
-@discord.app_commands.describe(keyword="検索キーワード (ファイル名、日付、タグの一部など)。")
-async def search_files(interaction: discord.Interaction, keyword: str):
-    if not keyword or len(keyword) < 2 :
-        await interaction.response.send_message("検索キーワードを2文字以上で入力してください。", ephemeral=True)
-        return
-    # list_filesコマンドに処理を委譲（実質同じ機能なので）
-    # 修正: self=bot を削除
-    await list_files.callback(interaction=interaction, year_month=None, keyword=keyword) # type: ignore [attr-defined]
-
-@bot.tree.command(name="download_file", description="指定されたファイル名のファイルをダウンロードします。")
-@discord.app_commands.describe(
-    year_month="ファイルが存在する年月 (例: 202505)。省略すると全フォルダ検索。", # ★ 引数追加
-    filename="ダウンロードしたい正確なファイル名。"
-)
-@discord.app_commands.autocomplete(year_month=year_month_autocomplete, filename=filename_autocomplete) # ★ オートコンプリート追加
-async def download_file(interaction: discord.Interaction, filename: str, year_month: str = None): # ★ year_month引数追加
-    await interaction.response.defer(ephemeral=False)
-    found_path = None
-    search_folders = []
-
-    if year_month:
-        if not re.fullmatch(r"\d{6}", year_month):
-            await interaction.followup.send("年月の形式が正しくありません。`YYYYMM`の形式で入力してください。", ephemeral=True)
-            return
-        target_folder = os.path.join(BASE_UPLOAD_FOLDER, year_month)
-        if os.path.exists(target_folder) and os.path.isdir(target_folder):
-            search_folders.append(target_folder)
-        else:
-            await interaction.followup.send(f"指定された年月フォルダ `{year_month}` が見つかりません。", ephemeral=True)
-            return
-    else: # year_monthが指定されていない場合は全年月フォルダを対象
-        if os.path.exists(BASE_UPLOAD_FOLDER):
-            for item in os.listdir(BASE_UPLOAD_FOLDER):
-                item_path = os.path.join(BASE_UPLOAD_FOLDER, item)
-                if os.path.isdir(item_path) and re.fullmatch(r"\d{6}", item):
-                    search_folders.append(item_path)
-    
-    if not search_folders:
-        await interaction.followup.send("検索対象のフォルダが見つかりません。", ephemeral=True)
-        return
-
-    for folder_path in search_folders:
-        prospective_path = os.path.join(folder_path, filename)
-        if os.path.exists(prospective_path) and os.path.isfile(prospective_path):
-            found_path = prospective_path
-            break
-    
-    if found_path:
-        try:
-            file_size = os.path.getsize(found_path)
-            if file_size > 8 * 1024 * 1024: # 8MB
-                await interaction.followup.send(
-                    f"ファイル '{filename}' ({file_size // 1024 // 1024}MB) はサイズが大きすぎるため、直接送信できません。"
-                )
-                return
-            await interaction.followup.send(f"ファイル '{filename}' を送信します:", file=discord.File(found_path))
-        except Exception as e:
-            print(f"ファイル送信エラー: {e}")
-            await interaction.followup.send(f"ファイル '{filename}' の送信中にエラーが発生しました。")
-    else:
-        await interaction.followup.send(f"ファイル '{filename}' が見つかりませんでした。ファイル名と年月を確認してください。")
-
-@bot.tree.command(name="edit_tags", description="ファイルのタグを編集します（ファイル名リネーム）。")
-@discord.app_commands.describe(
-    year_month="ファイルが存在する年月 (例: 202505)。", # ★ 引数追加
-    current_filename="現在の完全なファイル名。",
-    new_tags="新しいタグ (カンマ区切り、例: タグ1,タグ2,タグ3)。タグなしは notags と入力。"
-)
-@discord.app_commands.autocomplete(year_month=year_month_autocomplete, current_filename=filename_autocomplete) # ★ オートコンプリート追加
-@is_admin()
-async def edit_tags(interaction: discord.Interaction, year_month: str, current_filename: str, new_tags: str): # ★ year_month引数追加 (必須とした)
-    await interaction.response.defer(ephemeral=True)
-
-    if not re.fullmatch(r"\d{6}", year_month):
-        await interaction.followup.send("年月の形式が正しくありません。`YYYYMM`の形式で入力してください。")
-        return
-
-    original_ym_folder_path = os.path.join(BASE_UPLOAD_FOLDER, year_month)
-    if not (os.path.exists(original_ym_folder_path) and os.path.isdir(original_ym_folder_path)):
-        await interaction.followup.send(f"指定された年月フォルダ `{year_month}` が見つかりません。")
-        return
-
-    current_filepath = os.path.join(original_ym_folder_path, current_filename)
-    if not (os.path.exists(current_filepath) and os.path.isfile(current_filepath)):
-        await interaction.followup.send(f"ファイル '{current_filename}' が年月フォルダ `{year_month}` 内に見つかりませんでした。")
-        return
-    
-    if new_tags.strip().lower() == "notags":
-        processed_new_tags = "notags"
-    else:
-        tags_list = [sanitize_filename_component(tag.strip()) for tag in new_tags.split(',') if tag.strip()]
-        if not tags_list:
-            await interaction.followup.send("新しいタグが指定されていません。タグなしにする場合は `notags` と入力してください。")
-            return
-        processed_new_tags = "-".join(tags_list)
-    
-    parts = current_filename.split('_', 2)
-    if len(parts) < 3:
-        await interaction.followup.send(f"ファイル '{current_filename}' は期待される命名規則に従っていません。手動でのリネームが必要かもしれません。")
-        return
-    date_str = parts[0]
-    original_name_with_ext = parts[2]
-    base, ext = os.path.splitext(original_name_with_ext)
-    new_filename_constructed = f"{date_str}_{processed_new_tags}_{base}{ext}"
-    new_filepath = os.path.join(original_ym_folder_path, new_filename_constructed)
-
-    if current_filepath == new_filepath:
-        await interaction.followup.send(f"新しいタグは現在のタグと同じです。変更はありませんでした。")
-        return
-    if os.path.exists(new_filepath):
-        await interaction.followup.send(f"エラー: 新しいファイル名 '{new_filename_constructed}' は既に存在します。")
-        return
-    try:
-        os.rename(current_filepath, new_filepath)
-        await interaction.followup.send(
-            f"ファイル '{current_filename}' のタグを編集しました。\n"
-            f"新しいファイル名: `{new_filename_constructed}`"
-        )
-        print(f"ファイル名変更: '{current_filename}' -> '{new_filename_constructed}'")
-    except Exception as e:
-        print(f"ファイル名変更エラー: {e}")
-        await interaction.followup.send(f"タグの編集中にエラーが発生しました: {e}")
-
-@bot.tree.command(name="delete_file", description="指定されたファイルを削除します。")
-@discord.app_commands.describe(
-    year_month="ファイルが存在する年月 (例: 202505)。", # ★ 引数追加
-    filename="削除したい正確なファイル名。"
-)
-@discord.app_commands.autocomplete(year_month=year_month_autocomplete, filename=filename_autocomplete) # ★ オートコンプリート追加
-@is_admin()
-async def delete_file(interaction: discord.Interaction, year_month: str, filename: str): # ★ year_month引数追加 (必須とした)
-    await interaction.response.defer(ephemeral=True)
-
-    if not re.fullmatch(r"\d{6}", year_month):
-        await interaction.followup.send("年月の形式が正しくありません。`YYYYMM`の形式で入力してください。")
-        return
-
-    target_ym_folder_path = os.path.join(BASE_UPLOAD_FOLDER, year_month)
-    if not (os.path.exists(target_ym_folder_path) and os.path.isdir(target_ym_folder_path)):
-        await interaction.followup.send(f"指定された年月フォルダ `{year_month}` が見つかりません。")
-        return
-        
-    found_path = os.path.join(target_ym_folder_path, filename)
-    if os.path.exists(found_path) and os.path.isfile(found_path):
-        view = ConfirmDeleteView(found_path, filename, interaction.user)
-        await interaction.followup.send(
-            f"本当にファイル `{filename}` (フォルダ: `{year_month}`) を削除しますか？この操作は取り消せません。",
-            view=view,
-            ephemeral=True
-        )
-        await view.wait()
-    else:
-        await interaction.followup.send(f"ファイル '{filename}' が年月フォルダ `{year_month}` 内に見つかりませんでした。")
-
-class ConfirmDeleteView(discord.ui.View):
-    def __init__(self, filepath: str, filename: str, author: discord.User, timeout=30.0):
-        super().__init__(timeout=timeout)
-        self.filepath = filepath
-        self.filename = filename
-        self.author = author
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author.id:
-            await interaction.response.send_message("この操作はコマンドを実行した本人のみが行えます。", ephemeral=True)
-            return False
-        return True
-    @discord.ui.button(label="はい、削除します", style=discord.ButtonStyle.danger, custom_id="confirm_delete")
-    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            os.remove(self.filepath)
-            print(f"ファイル '{self.filename}' をユーザー '{interaction.user}' の指示により削除しました。")
-            await interaction.response.edit_message(content=f"ファイル `{self.filename}` を削除しました。", view=None)
-        except Exception as e:
-            print(f"ファイル削除エラー ({self.filename}): {e}")
-            await interaction.response.edit_message(content=f"ファイル `{self.filename}` の削除中にエラーが発生しました。", view=None)
-        self.stop()
-    @discord.ui.button(label="いいえ、キャンセル", style=discord.ButtonStyle.secondary, custom_id="cancel_delete")
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="ファイル削除をキャンセルしました。", view=None)
-        self.stop()
-    async def on_timeout(self):
-        print(f"ファイル '{self.filename}' の削除確認がタイムアウトしました。")
-        pass
-
-@bot.tree.command(name="list_gemini_models", description="自動タグ付けに利用可能なGeminiモデルの一覧を表示します。")
-async def list_gemini_models(interaction: discord.Interaction):
-    # 修正: APIキーの存在とモデルインスタンスの初期化状態で判断
-    if not GEMINI_API_KEY:
-        await interaction.response.send_message("Gemini APIキーが設定されていません。", ephemeral=True)
-        return
-    if not gemini_model_instance:
-        await interaction.response.send_message("Geminiモデルが初期化されていません。APIキーを確認してください。", ephemeral=True)
-        return
-
+# --- /gemini サブコマンド ---
+@gemini_group.command(name="list", description="自動タグ付けに利用可能なGeminiモデルの一覧を表示します。")
+async def gemini_list(interaction: discord.Interaction):
+    if not GEMINI_API_KEY: await interaction.response.send_message("Gemini APIキーが設定されていません。", ephemeral=True); return
+    if not gemini_model_instance: await interaction.response.send_message("Geminiモデルが初期化されていません。", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     try:
-        models_info = "利用可能なGeminiモデル (generateContentサポート):\n"
-        count = 0
+        models_info = "利用可能なGeminiモデル (generateContentサポート):\n"; count = 0
         for model in genai.list_models():
             if 'generateContent' in model.supported_generation_methods:
                 model_display_name = model.name.replace("models/", "")
-                models_info += f"- `{model_display_name}` ({model.display_name})\n"
-                count += 1
-                if len(models_info) > 1800:
-                    await interaction.followup.send(models_info, ephemeral=True)
-                    models_info = ""
-        if count == 0: models_info = "利用可能なGeminiモデルが見つかりませんでした (generateContentサポート)。"
+                models_info += f"- `{model_display_name}` ({model.display_name})\n"; count += 1
+                if len(models_info) > 1800: await interaction.followup.send(models_info, ephemeral=True); models_info = ""
+        if count == 0: models_info = "利用可能なGeminiモデルが見つかりませんでした。"
         if models_info: await interaction.followup.send(models_info, ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"モデル一覧の取得中にエラーが発生しました: {e}", ephemeral=True)
+    except Exception as e: await interaction.followup.send(f"モデル一覧の取得中にエラー: {e}", ephemeral=True)
 
-@bot.tree.command(name="set_model", description="自動タグ付けに使用するGeminiモデルを設定します。")
+@gemini_group.command(name="set", description="自動タグ付けに使用するGeminiモデルを設定します。")
 @discord.app_commands.describe(model_name="Geminiモデル名 (例: gemini-1.5-flash-latest)。")
 @discord.app_commands.autocomplete(model_name=gemini_model_autocomplete)
 @is_admin()
-async def set_model(interaction: discord.Interaction, model_name: str):
+async def gemini_set(interaction: discord.Interaction, model_name: str):
     global current_gemini_model, gemini_model_instance
-    # 修正: APIキーの存在とモデルインスタンスの初期化状態で判断
-    if not GEMINI_API_KEY:
-        await interaction.response.send_message("Gemini APIキーが設定されていません。", ephemeral=True)
-        return
-    if not gemini_model_instance: # 初期化に失敗している場合もここで捉える
-         await interaction.response.send_message("Geminiモデルが初期化されていません。APIキーやデフォルトモデル名を確認してください。", ephemeral=True)
-         return
-
+    if not GEMINI_API_KEY: await interaction.response.send_message("Gemini APIキーが設定されていません。", ephemeral=True); return
+    if not gemini_model_instance: await interaction.response.send_message("Geminiモデルが初期化されていません。", ephemeral=True); return
     await interaction.response.defer(ephemeral=True)
     try:
         full_model_name_to_check = model_name if model_name.startswith("models/") else f"models/{model_name}"
-        retrieved_model = genai.get_model(full_model_name_to_check) # これが失敗すればモデルは存在しない
+        retrieved_model = genai.get_model(full_model_name_to_check)
         if 'generateContent' not in retrieved_model.supported_generation_methods:
-            await interaction.followup.send(
-                f"モデル `{model_name}` は `generateContent` をサポートしていません。\n"
-                "`/list_gemini_models` でサポートされているモデルを確認してください。",
-                ephemeral=True)
-            return
-        # 新しいモデルでインスタンスを再作成する前に、現在のインスタンスを破棄する処理は通常不要
-        # genai.GenerativeModel() で新しいものを作ればよい
-        new_model_instance = genai.GenerativeModel(
-            retrieved_model.name,
-            safety_settings={HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                             HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE})
+            await interaction.followup.send(f"モデル `{model_name}` は `generateContent` をサポートしていません。", ephemeral=True); return
+        new_model_instance = genai.GenerativeModel(retrieved_model.name, safety_settings={
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE })
         current_gemini_model = retrieved_model.name.replace("models/", "")
-        gemini_model_instance = new_model_instance # グローバルインスタンスを更新
-        await interaction.followup.send(f"自動タグ付けに使用するGeminiモデルを `{current_gemini_model}` に設定しました。", ephemeral=True)
+        gemini_model_instance = new_model_instance
+        await interaction.followup.send(f"自動タグ付けのGeminiモデルを `{current_gemini_model}` に設定しました。", ephemeral=True)
         print(f"Geminiモデルが '{current_gemini_model}' に変更されました。")
     except Exception as e:
-        error_message = f"モデル `{model_name}` の設定に失敗しました: {e}\n"
-        error_message += "入力されたモデル名が正しいか、`/list_gemini_models` コマンドで利用可能なモデルを確認してください。"
-        await interaction.followup.send(error_message, ephemeral=True)
+        await interaction.followup.send(f"モデル `{model_name}` の設定に失敗: {e}", ephemeral=True)
         print(f"Geminiモデル '{model_name}' の設定失敗: {e}")
 
-@bot.tree.command(name="current_model", description="現在設定されているGeminiモデル名を表示します。")
-async def current_model(interaction: discord.Interaction):
+@gemini_group.command(name="current", description="現在設定されているGeminiモデル名を表示します。")
+async def gemini_current(interaction: discord.Interaction):
     if not gemini_model_instance:
         await interaction.response.send_message(f"Geminiモデルは現在設定されていません、または初期化に失敗しています。", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"現在設定されているGeminiモデルは `{current_gemini_model}` です。", ephemeral=True)
+    else: await interaction.response.send_message(f"現在設定されているGeminiモデルは `{current_gemini_model}` です。", ephemeral=True)
 
 @bot.tree.command(name="help_nasbot", description="このBOTのコマンド一覧と簡単な説明を表示します。")
 async def help_nasbot(interaction: discord.Interaction):
     embed = discord.Embed(title="ファイル管理BOT ヘルプ", description="このBOTで利用可能なコマンド一覧です。", color=discord.Color.blue())
-    embed.add_field(name="ファイル操作", value=(
-        "`/upload_guide` - ファイルのアップロード方法を表示します。\n"
-        "`/list_files [年月] [キーワード]` - ファイル一覧を表示します。\n"
-        "`/search_files <キーワード>` - ファイルを検索します。\n"
-        "`/download_file [年月] <ファイル名>` - ファイルをダウンロードします。" # ★ 変更
-    ), inline=False)
-    embed.add_field(name="管理者向けコマンド", value=(
-        "`/edit_tags <年月> <現在のファイル名> <新しいタグ>` - ファイルのタグを編集します。\n" # ★ 変更
-        "`/delete_file <年月> <ファイル名>` - ファイルを削除します。\n" # ★ 変更
-        "`/set_model <モデル名>` - 自動タグ付けに使用するGeminiモデルを設定します。"
+    # /files グループに関する記述を削除
+    embed.add_field(name="Geminiモデル設定 (`/gemini`)", value=(
+        "`  set <model_name <モデル名>]` - (管理者) 自動タグ付けに使用するGeminiモデルを設定します。\n"
+        "`  current` - 現在のGeminiモデル名を表示します。\n"
+        "`  list` - 利用可能なGeminiモデルの一覧を表示します。\n"
     ), inline=False)
     embed.add_field(name="その他", value=(
-        "`/current_model` - 現在のGeminiモデル名を表示します。\n"
-        "`/list_gemini_models` - 利用可能なGeminiモデルの一覧を表示します。\n"
+        "`/upload_guide` - ファイルのアップロード方法を表示します。\n"
         "`/help_nasbot` - このヘルプを表示します。"
     ), inline=False)
     embed.set_footer(text="ファイルを直接このチャンネルにアップロードすることでも処理が開始されます。")
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# --- コマンドグループをBOTに追加 ---
+# bot.tree.add_command(files_group) # /files グループの登録を削除
+bot.tree.add_command(gemini_group)
 
 # --- BOT実行 ---
 if __name__ == "__main__":
