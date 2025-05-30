@@ -6,7 +6,7 @@
     "tagging_prompt_file": "Tagging_prompt.txt",
     "base_upload_folder": "uploads",
     "upload_destination": "gdrive",
-    "gdrive_service_account_key_path": "assistant-for-pc-96f32-3b037b542681.json",
-    "gdrive_target_folder_id": "1toAsXefzpjzwcckqUZibty4ykCyJpFuH",
+    "gdrive_service_account_key_path": "assistant.json",
+    "gdrive_target_folder_id": "",
     "gdrive_create_ym_folders": true
 }
